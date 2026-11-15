@@ -1,0 +1,32 @@
+name: scope-failover
+on:
+  workflow_dispatch:
+  push:
+    paths: ['ci/**', '.github/workflows/scope.yml']
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [8, 9, 10]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q qemu-system-x86 qemu-utils cloud-image-utils
+      - run: ci/boot-vm.sh ${{ matrix.release }}
+      - run: scp -F ci/ssh_config ci/test.sh ci/writer.py vm:/root/
+      - run: ssh -F ci/ssh_config vm 'sh /root/test.sh' 2>&1 | tee result-${{ matrix.release }}.txt
+      - if: always()
+        run: scp -F ci/ssh_config 'vm:/root/*.pcap' . || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: el${{ matrix.release }}
+          path: |
+            result-*.txt
+            *.pcap
+            serial.log

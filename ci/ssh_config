@@ -1,0 +1,9 @@
+Host vm
+  HostName 127.0.0.1
+  Port 2222
+  User root
+  IdentityFile key
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+  ServerAliveInterval 30

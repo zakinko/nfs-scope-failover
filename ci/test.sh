@@ -1,0 +1,89 @@
+#!/bin/sh
+# Runs inside the VM as root.  Server nfsd in the host netns, client in
+# netns "cli" over a veth.  Failover = stop nfsd, restart it with another
+# (or the same) UTS nodename, which is what nfsd copies into the server
+# scope at start on RHEL kernels.
+set -u
+cd /root
+dnf -q -y install nfs-utils python3 wireshark-cli tcpdump iproute >/dev/null 2>&1 \
+  || dnf -y install nfs-utils python3 wireshark-cli tcpdump iproute
+echo "== versions"
+uname -r; rpm -q nfs-utils kernel | sort -u
+echo "== native scope option"
+NATIVE=no
+if rpc.nfsd --help 2>&1 | grep -q -- '-S'; then NATIVE=yes; fi
+grep -n -i scope /etc/nfs.conf || true
+echo "rpc.nfsd -S: $NATIVE"; rpc.nfsd --help 2>&1 | grep -i -- scope || true
+
+# network: host 10.9.0.1 <-> cli 10.9.0.2
+ip netns add cli
+ip link add vh type veth peer name vc
+ip link set vc netns cli
+ip addr add 10.9.0.1/24 dev vh; ip link set vh up
+ip netns exec cli ip addr add 10.9.0.2/24 dev vc
+ip netns exec cli ip link set vc up; ip netns exec cli ip link set lo up
+
+mkdir -p /srv/export /mnt/c
+chmod 777 /srv/export
+echo '/srv/export 10.9.0.0/24(rw,no_root_squash,sync,fsid=1)' > /etc/exports
+systemctl start nfs-server || { journalctl -u nfs-server | tail; }
+systemctl is-active nfsdcld 2>/dev/null; ls -la /var/lib/nfs /var/lib/nfs/v4recovery /var/lib/nfs/nfsdcld 2>&1 | head -30
+rpc.nfsd 0
+
+start_nfsd() { # $1 = hostname, $2 = native scope or ""
+  echo 15 > /proc/fs/nfsd/nfsv4leasetime
+  echo 15 > /proc/fs/nfsd/nfsv4gracetime
+  if [ -n "$2" ]; then
+    rpc.nfsd -S "$2" 8
+  else
+    unshare -u sh -c "hostname $1; rpc.nfsd 8"
+  fi
+  exportfs -r
+  echo "nfsd started: host=$1 native=$2 threads=$(cat /proc/fs/nfsd/threads) versions=$(cat /proc/fs/nfsd/versions)"
+}
+
+runcase() { # name vers hostA hostB nativeA nativeB
+  name=$1; v=$2
+  echo; echo "########## case $name vers=$v A=$3/$5 B=$4/$6"
+  dmesg -C
+  timeout 300 tcpdump -q -i vh -s 0 -w /root/$name.pcap port 2049 2>/dev/null &
+  tp=$!
+  start_nfsd "$3" "$5"
+  sleep 1
+  ip netns exec cli timeout 60 mount -t nfs -o vers=$v,timeo=50 10.9.0.1:/srv/export /mnt/c || { echo MOUNT FAILED; }
+  f=/mnt/c/$name.dat; rm -f $f
+  timeout 200 ./writer.py $f 75 > /root/$name.writer 2>&1 &
+  wp=$!
+  sleep 8
+  echo "-- failover at $(date +%s)"
+  rpc.nfsd 0; exportfs -f
+  sleep 3
+  start_nfsd "$4" "$6"
+  wait $wp; echo "writer exit $?"
+  cat /root/$name.writer
+  echo "-- extra lock attempt after failover"
+  timeout 60 python3 -c "import fcntl,os;fd=os.open('$f',os.O_RDWR);fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);print('relock ok')" 2>&1
+  echo "-- client dmesg"; dmesg | grep -v -e audit | tail -40
+  umount -f /mnt/c 2>/dev/null || umount -l /mnt/c
+  rpc.nfsd 0; sleep 1
+  kill $tp 2>/dev/null; wait $tp 2>/dev/null
+  echo "-- EXCHANGE_ID server scope / owner on the wire"
+  tshark -r /root/$name.pcap -Y 'nfs.opcode == 42' -V 2>/dev/null \
+    | grep -E -i 'server scope|major id|^Frame [0-9]+:|eir_server|server_scope' | grep -v -i 'frame length' | head -30
+}
+
+for v in 4.2 4.1; do
+  runcase diff-$v $v nodeA nodeB "" ""
+  runcase same-$v $v nfs-ha nfs-ha "" ""
+  if [ $NATIVE = yes ]; then
+    runcase native-$v $v nodeA nodeB nfs-ha nfs-ha
+  fi
+done
+
+echo; echo "########## probe: nfsd inside a separate netns"
+ip netns add srvA
+dmesg -C
+ip netns exec srvA rpc.nfsd 8; echo "rpc.nfsd in netns exit $?"
+ip netns exec srvA cat /proc/fs/nfsd/threads
+ip netns exec srvA rpc.nfsd 0
+dmesg | tail -10
