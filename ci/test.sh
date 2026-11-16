@@ -9,6 +9,8 @@ dnf -q -y install nfs-utils python3 wireshark-cli tcpdump iproute >/dev/null 2>&
   || dnf -y install nfs-utils python3 wireshark-cli tcpdump iproute
 echo "== versions"
 uname -r; rpm -q nfs-utils kernel | sort -u
+echo "== tshark field names"
+tshark -G fields 2>/dev/null | cut -f3 | grep -E 'claim_type|reclaim|nfsstat4$' | sort -u | head
 echo "== native scope option"
 NATIVE=no
 # --help output does not list every option; look in the binary
@@ -76,10 +78,11 @@ runcase() { # name vers hostA hostB nativeA nativeB
     -e frame.number -e frame.time_relative -e nfs.data 2>&1 | head
   tshark -r /root/$name.pcap -Y 'nfs.opcode == 42 && rpc.msgtyp == 1' -x 2>/dev/null \
     | grep -E -o '  [^ ].{0,16}$' | tr -d '\n' | tr -s '.' ; echo
-  echo "-- state ops on the wire (OPEN claim, LOCK reclaim, RECLAIM_COMPLETE, errors)"
-  tshark -r /root/$name.pcap -Y 'nfs' -V 2>/dev/null | grep -E \
-    -e '^Frame [0-9]+:' -e 'Opcode: (OPEN|LOCK|RECLAIM_COMPLETE|EXCHANGE_ID|CREATE_SESSION) ' \
-    -e 'claim_type|reclaim\?|Status: NFS4ERR' | grep -B1 -v '^Frame' | grep -v '^--' | grep -v 'Main Opcode' | paste - - | uniq -c | head -60
+  echo "-- state ops after the failover: time, ops, OPEN claim type, LOCK reclaim, status"
+  tshark -r /root/$name.pcap -Y 'nfs.opcode == 18 || nfs.opcode == 12 || nfs.opcode == 58 || nfs.opcode == 42' \
+    -T fields -E occurrence=a -e frame.time_relative -e rpc.msgtyp -e nfs.opcode \
+    -e nfs.open.claim_type -e nfs.lock.reclaim -e nfs.nfsstat4 2>&1 | grep -v 'Running as' \
+    | awk '$1 > 20' | head -40
 }
 
 for v in 4.2 4.1; do
@@ -93,7 +96,10 @@ done
 echo; echo "########## probe: nfsd inside a separate netns"
 ip netns add srvA
 dmesg -C
-ip netns exec srvA rpc.nfsd 8; echo "rpc.nfsd in netns exit $?"
-ip netns exec srvA cat /proc/fs/nfsd/threads
-ip netns exec srvA rpc.nfsd 0
+# /proc/fs/nfsd must be mounted from inside the netns, or rpc.nfsd
+# talks to the init namespace's nfsd.
+ip netns exec srvA sh -c 'umount /proc/fs/nfsd; mount -t nfsd nfsd /proc/fs/nfsd &&
+  ip link set lo up && rpc.nfsd 8; echo "rpc.nfsd in netns exit $?";
+  echo "threads $(cat /proc/fs/nfsd/threads)"; rpc.nfsd 0'
+echo "init netns threads $(cat /proc/fs/nfsd/threads)"
 dmesg | tail -10
