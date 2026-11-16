@@ -10,7 +10,7 @@ dnf -q -y install nfs-utils python3 wireshark-cli tcpdump iproute >/dev/null 2>&
 echo "== versions"
 uname -r; rpm -q nfs-utils kernel | sort -u
 echo "== tshark field names"
-tshark -G fields 2>/dev/null | cut -f3 | grep -E 'claim_type|reclaim|nfsstat4$' | sort -u | head
+tshark -G fields 2>/dev/null | cut -f3 | grep -E 'claim_type|deleg.*type|reclaim|nfsstat4$' | sort -u | head
 echo "== native scope option"
 NATIVE=no
 # --help output does not list every option; look in the binary
@@ -68,6 +68,10 @@ runcase() { # name vers hostA hostB nativeA nativeB
   rpc.nfsd 0; exportfs -f
   sleep 3
   start_nfsd "$4" "$6"
+  sleep 25
+  ino=$(stat -c %i /srv/export/$name.dat)
+  echo "-- server B locks on inode $ino, 25s after start (/proc/locks)"
+  grep ":$ino " /proc/locks || echo "NO LOCK on server"
   wait $cp
   cat /root/$name.client
   echo "-- client dmesg"; dmesg | grep -E 'NFS|nfs|grace|reclaim|lock' | tail -40
@@ -81,7 +85,7 @@ runcase() { # name vers hostA hostB nativeA nativeB
   echo "-- state ops after the failover: time, ops, OPEN claim type, LOCK reclaim, status"
   tshark -r /root/$name.pcap -Y 'nfs.opcode == 18 || nfs.opcode == 12 || nfs.opcode == 58 || nfs.opcode == 42' \
     -T fields -E occurrence=a -e frame.time_relative -e rpc.msgtyp -e nfs.opcode \
-    -e nfs.open.claim_type -e nfs.lock.reclaim -e nfs.nfsstat4 2>&1 | grep -v 'Running as' \
+    -e nfs.open.claim_type -e nfs.open.delegation_type -e nfs.lock.reclaim -e nfs.nfsstat4 2>&1 | grep -v 'Running as' \
     | awk '$1 > 20' | head -40
 }
 
