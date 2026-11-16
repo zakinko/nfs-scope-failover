@@ -11,7 +11,9 @@ echo "== versions"
 uname -r; rpm -q nfs-utils kernel | sort -u
 echo "== native scope option"
 NATIVE=no
-if rpc.nfsd --help 2>&1 | grep -q -- '-S'; then NATIVE=yes; fi
+# --help output does not list every option; look in the binary
+if grep -a -q 'scope' "$(command -v rpc.nfsd)"; then NATIVE=yes; fi
+grep -a -o '[a-z]*scope[a-z=]*' "$(command -v rpc.nfsd)" | sort -u
 grep -n -i scope /etc/nfs.conf || true
 echo "rpc.nfsd -S: $NATIVE"; rpc.nfsd --help 2>&1 | grep -i -- scope || true
 
@@ -50,9 +52,16 @@ runcase() { # name vers hostA hostB nativeA nativeB
   tp=$!
   start_nfsd "$3" "$5"
   sleep 1
-  ip netns exec cli sh /root/client.sh $v $name 75 > /root/$name.client 2>&1 &
+  ip netns exec cli sh /root/client.sh $v $name 60 > /root/$name.client 2>&1 &
   cp=$!
-  sleep 10
+  # Server A's first LOCK can get NFS4ERR_GRACE (lockd's grace while
+  # v3 is enabled); fail over only once the lock is really held.
+  i=0
+  until grep -q locked /root/$name.client 2>/dev/null; do
+    i=$((i+1)); [ $i -lt 150 ] || { echo "writer never got the lock"; break; }; sleep 1
+  done
+  echo "-- lock held after ${i}s"
+  sleep 5
   echo "-- failover at $(date +%s)"
   rpc.nfsd 0; exportfs -f
   sleep 3
@@ -70,7 +79,7 @@ runcase() { # name vers hostA hostB nativeA nativeB
   echo "-- state ops on the wire (OPEN claim, LOCK reclaim, RECLAIM_COMPLETE, errors)"
   tshark -r /root/$name.pcap -Y 'nfs' -V 2>/dev/null | grep -E \
     -e '^Frame [0-9]+:' -e 'Opcode: (OPEN|LOCK|RECLAIM_COMPLETE|EXCHANGE_ID|CREATE_SESSION) ' \
-    -e 'claim_type|reclaim\?|Status: NFS4ERR' | grep -B1 -v '^Frame' | grep -v '^--' | head -80
+    -e 'claim_type|reclaim\?|Status: NFS4ERR' | grep -B1 -v '^Frame' | grep -v '^--' | grep -v 'Main Opcode' | paste - - | uniq -c | head -60
 }
 
 for v in 4.2 4.1; do
