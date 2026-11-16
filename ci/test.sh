@@ -50,26 +50,27 @@ runcase() { # name vers hostA hostB nativeA nativeB
   tp=$!
   start_nfsd "$3" "$5"
   sleep 1
-  ip netns exec cli timeout 60 mount -t nfs -o vers=$v,timeo=50 10.9.0.1:/srv/export /mnt/c || { echo MOUNT FAILED; }
-  f=/mnt/c/$name.dat; rm -f $f
-  timeout 200 ./writer.py $f 75 > /root/$name.writer 2>&1 &
-  wp=$!
-  sleep 8
+  ip netns exec cli sh /root/client.sh $v $name 75 > /root/$name.client 2>&1 &
+  cp=$!
+  sleep 10
   echo "-- failover at $(date +%s)"
   rpc.nfsd 0; exportfs -f
   sleep 3
   start_nfsd "$4" "$6"
-  wait $wp; echo "writer exit $?"
-  cat /root/$name.writer
-  echo "-- extra lock attempt after failover"
-  timeout 60 python3 -c "import fcntl,os;fd=os.open('$f',os.O_RDWR);fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);print('relock ok')" 2>&1
-  echo "-- client dmesg"; dmesg | grep -v -e audit | tail -40
-  umount -f /mnt/c 2>/dev/null || umount -l /mnt/c
+  wait $cp
+  cat /root/$name.client
+  echo "-- client dmesg"; dmesg | grep -E 'NFS|nfs|grace|reclaim|lock' | tail -40
   rpc.nfsd 0; sleep 1
   kill $tp 2>/dev/null; wait $tp 2>/dev/null
-  echo "-- EXCHANGE_ID server scope / owner on the wire"
-  tshark -r /root/$name.pcap -Y 'nfs.opcode == 42' -V 2>/dev/null \
-    | grep -E -i 'server scope|major id|^Frame [0-9]+:|eir_server|server_scope' | grep -v -i 'frame length' | head -30
+  echo "-- EXCHANGE_ID replies: major id and server scope bytes"
+  tshark -r /root/$name.pcap -Y 'nfs.opcode == 42 && rpc.msgtyp == 1' -T fields \
+    -e frame.number -e frame.time_relative -e nfs.data 2>&1 | head
+  tshark -r /root/$name.pcap -Y 'nfs.opcode == 42 && rpc.msgtyp == 1' -x 2>/dev/null \
+    | grep -E -o '  [^ ].{0,16}$' | tr -d '\n' | tr -s '.' ; echo
+  echo "-- state ops on the wire (OPEN claim, LOCK reclaim, RECLAIM_COMPLETE, errors)"
+  tshark -r /root/$name.pcap -Y 'nfs' -V 2>/dev/null | grep -E \
+    -e '^Frame [0-9]+:' -e 'Opcode: (OPEN|LOCK|RECLAIM_COMPLETE|EXCHANGE_ID|CREATE_SESSION) ' \
+    -e 'claim_type|reclaim\?|Status: NFS4ERR' | grep -B1 -v '^Frame' | grep -v '^--' | head -80
 }
 
 for v in 4.2 4.1; do
